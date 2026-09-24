@@ -91,28 +91,25 @@ export const getDashboard = createServerFn({ method: "GET" })
     ]);
 
     const connected = integration.data?.status === "connected";
+    const tokenCheck = await verifyPagePilotToken(data.workspaceId);
 
     return {
       workspace: workspace.data,
       integration: integration.data,
-      tokenCheck: {
-        valid: connected,
-        state: connected ? "valid" : "missing",
-        checked_at: integration.data?.last_checked_at ?? new Date().toISOString(),
-        reason: connected ? "Token is valid" : "PagePilot is not connected",
-      },
-      genuinelyConnected: connected,
+      tokenCheck,
+      genuinelyConnected: connected && tokenCheck.valid,
       recommendations: recommendations.data ?? [],
       executions: executions.data ?? [],
     };
-
   });
 
 export const getRecommendation = createServerFn({ method: "GET" })
   .inputValidator((input: { workspaceId: string; recommendationId: string }) => input)
   .middleware([requireSupabaseAuth])
-  .handler(async ({ data }) => {
-    const db = await adminClient();
+  .handler(async ({ data, context }) => {
+    const ctx = context as unknown as AuthContext;
+    await assertMember(ctx, data.workspaceId);
+    const db = ctx.supabase;
 
     const { data: recommendation, error } = await db
       .from("recommendations")
@@ -159,7 +156,17 @@ export const getRecommendation = createServerFn({ method: "GET" })
       .eq("provider", "pagepilot")
       .maybeSingle();
 
-    return { recommendation, action, approval, execution, integration };
+    const tokenCheck = await verifyPagePilotToken(data.workspaceId);
+
+    return {
+      recommendation,
+      action,
+      approval,
+      execution,
+      integration,
+      tokenCheck,
+      genuinelyConnected: integration?.status === "connected" && tokenCheck.valid,
+    };
   });
 
 export const decideAction = createServerFn({ method: "POST" })
@@ -259,6 +266,26 @@ export const executeAction = createServerFn({ method: "POST" })
       throw new Error("This action was not approved");
     }
 
+    // One execution per action: a stable key makes any retry a safe no-op.
+    const idempotencyKey = `exec:${action.id}`;
+    const { data: existing } = await db
+      .from("executions")
+      .select("id, status, attempts, updated_at")
+      .eq("idempotency_key", idempotencyKey)
+      .maybeSingle();
+
+    if (action.status === "executed" || existing?.status === "succeeded") {
+      return { executionId: (existing?.id as string) ?? null, status: "succeeded", replayed: true };
+    }
+    if (existing?.status === "pending") {
+      const staleAfterMs = 2 * 60_000; // older pending rows are treated as orphaned
+      const age = Date.now() - new Date(existing.updated_at).getTime();
+      if (age < staleAfterMs) throw new Error("This action is already being executed");
+    }
+    if (action.status !== "approved") {
+      throw new Error(`This action cannot be executed while it is "${action.status}"`);
+    }
+
     const { data: integration } = await db
       .from("integrations")
       .select("id, status, access_token, page_state")
@@ -287,24 +314,50 @@ export const executeAction = createServerFn({ method: "POST" })
     const currentInput = (action.input ?? {}) as Record<string, unknown>;
     const input = parseChangeCtaInput({
       ...currentInput,
-      page_url: recommendation?.page_url ?? currentInput["page_url"],
+      page_url: currentInput["page_url"] ?? recommendation?.page_url,
     });
 
-    const idempotencyKey = `exec:${action.id}:${Date.now().toString(36)}`;
-    const { data: execution, error: execError } = await db
-      .from("executions")
-      .insert({
-        workspace_id: data.workspaceId,
-        action_id: action.id,
-        approval_id: approval.id,
-        idempotency_key: idempotencyKey,
-        status: "pending",
-      })
-      .select("id, status, attempts")
-      .single();
-    if (execError) throw new Error(execError.message);
-
-    const attempts = (execution.attempts ?? 0) + 1;
+    const attempts = (existing?.attempts ?? 0) + 1;
+    let executionId: string;
+    if (existing) {
+      const { data: claimed, error: claimError } = await db
+        .from("executions")
+        .update({
+          status: "pending",
+          attempts,
+          provider_response: null,
+          verified_at: null,
+          verification_result: null,
+        })
+        .eq("id", existing.id)
+        .eq("status", existing.status)
+        .eq("attempts", existing.attempts)
+        .select("id");
+      if (claimError) throw new Error(claimError.message);
+      if (!claimed || claimed.length === 0) {
+        throw new Error("This action is already being executed");
+      }
+      executionId = existing.id as string;
+    } else {
+      const { data: inserted, error: execError } = await db
+        .from("executions")
+        .insert({
+          workspace_id: data.workspaceId,
+          action_id: action.id,
+          approval_id: approval.id,
+          idempotency_key: idempotencyKey,
+          status: "pending",
+          attempts,
+        })
+        .select("id")
+        .single();
+      if (execError) {
+        // 23505: unique violation, a concurrent request claimed this action first
+        if (execError.code === "23505") throw new Error("This action is already being executed");
+        throw new Error(execError.message);
+      }
+      executionId = inserted.id as string;
+    }
 
     try {
       const { response, pageState } = pagePilotChangeCta({
@@ -314,35 +367,50 @@ export const executeAction = createServerFn({ method: "POST" })
         pageState: (integration.page_state ?? {}) as PageState,
       });
 
-      await db.from("integrations").update({ page_state: pageState }).eq("id", integration.id);
-      await db
+      const { error: stateError } = await db
+        .from("integrations")
+        .update({ page_state: pageState })
+        .eq("id", integration.id);
+      if (stateError) throw new Error(stateError.message);
+      const { error: successError } = await db
         .from("executions")
         .update({ status: "succeeded", attempts, provider_response: response })
-        .eq("id", execution.id);
+        .eq("id", executionId)
+        .eq("attempts", attempts);
+      if (successError) throw new Error(successError.message);
       await writeAudit(db, {
         workspace_id: data.workspaceId,
         event_type: "action.executed",
         actor_id: ctx.userId,
         entity_type: "execution",
-        entity_id: execution.id,
+        entity_id: executionId,
         details: { attempts, request_id: response.request_id, new_cta: input.new_cta },
       });
 
-      const live = pagePilotReadPage(pageState, input.page_url);
+      // Verify against what was persisted, not the in-memory result.
+      const { data: saved, error: readError } = await db
+        .from("integrations")
+        .select("page_state")
+        .eq("id", integration.id)
+        .single();
+      if (readError) throw new Error(readError.message);
+      const live = pagePilotReadPage((saved.page_state ?? {}) as PageState, input.page_url);
       const verified = live?.current_cta === input.new_cta;
       const verificationResult = verified
         ? `Verified: page CTA is now "${input.new_cta}"`
         : "Verification failed: page CTA does not match the approved change";
-      await db
+      const { error: verifyError } = await db
         .from("executions")
         .update({ verified_at: new Date().toISOString(), verification_result: verificationResult })
-        .eq("id", execution.id);
+        .eq("id", executionId)
+        .eq("attempts", attempts);
+      if (verifyError) throw new Error(verifyError.message);
       await writeAudit(db, {
         workspace_id: data.workspaceId,
         event_type: verified ? "execution.verified" : "execution.verification_failed",
         actor_id: ctx.userId,
         entity_type: "execution",
-        entity_id: execution.id,
+        entity_id: executionId,
         details: { verification_result: verificationResult },
       });
 
@@ -354,19 +422,20 @@ export const executeAction = createServerFn({ method: "POST" })
           .eq("id", action.recommendation_id);
       }
 
-      return { executionId: execution.id as string, status: "succeeded", replayed: false };
+      return { executionId, status: "succeeded", replayed: false };
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown execution error";
       await db
         .from("executions")
         .update({ status: "failed", attempts, provider_response: { ok: false, error: message } })
-        .eq("id", execution.id);
+        .eq("id", executionId)
+        .eq("attempts", attempts);
       await writeAudit(db, {
         workspace_id: data.workspaceId,
         event_type: "execution.failed",
         actor_id: ctx.userId,
         entity_type: "execution",
-        entity_id: execution.id,
+        entity_id: executionId,
         details: { attempts, error: message },
       });
       throw new Error(message);
@@ -542,4 +611,3 @@ export const saveMySubmission = createServerFn({ method: "POST" })
     if (error) throw new Error(error.message);
     return { ok: true, submitted: Boolean(data.submit) };
   });
-
