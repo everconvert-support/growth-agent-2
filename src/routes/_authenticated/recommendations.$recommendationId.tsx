@@ -41,8 +41,7 @@ function RecommendationPage() {
   const queryKey = ["recommendation", current?.id, recommendationId];
   const { data, isLoading } = useQuery({
     queryKey,
-    queryFn: () =>
-      fetchRecommendation({ data: { workspaceId: current!.id, recommendationId } }),
+    queryFn: () => fetchRecommendation({ data: { workspaceId: current!.id, recommendationId } }),
     enabled: Boolean(current?.id),
   });
 
@@ -64,8 +63,7 @@ function RecommendationPage() {
   });
 
   const executeMutation = useMutation({
-    mutationFn: () =>
-      execute({ data: { workspaceId: current!.id, actionId: data!.action!.id } }),
+    mutationFn: () => execute({ data: { workspaceId: current!.id, actionId: data!.action!.id } }),
     onSuccess: (result) => {
       toast.success(
         result.replayed
@@ -89,7 +87,10 @@ function RecommendationPage() {
   const approval = data.approval as any;
   const execution = data.execution as any;
   const input = (action?.input ?? {}) as Record<string, string>;
-  const connected = (data.integration as any)?.status === "connected";
+  const connected = data.genuinelyConnected;
+  const tokenCheck = data.tokenCheck;
+  const storedConnected = (data.integration as any)?.status === "connected";
+  const executed = action?.status === "executed";
 
   return (
     <AppShell title={(data.recommendation as any).title} description="Detected opportunity">
@@ -160,19 +161,32 @@ function RecommendationPage() {
                         {approval.decision === "approved" ? "Approved" : "Rejected"} on{" "}
                         {new Date(approval.decided_at).toLocaleString()}
                       </p>
-                      {approval.decision === "approved" ? (
+                      {approval.decision === "approved" && executed ? (
+                        <p className="text-muted-foreground">
+                          Executed and verified
+                          {execution?.verified_at
+                            ? ` on ${new Date(execution.verified_at).toLocaleString()}`
+                            : ""}
+                          .
+                        </p>
+                      ) : approval.decision === "approved" ? (
                         <>
                           <Button
                             disabled={executeMutation.isPending || !connected}
                             onClick={() => executeMutation.mutate()}
                           >
-                            {execution?.status === "succeeded"
+                            {execution?.status === "failed"
                               ? "Retry execution"
                               : "Execute approved action"}
                           </Button>
-                          {!connected ? (
+                          {!storedConnected ? (
                             <p className="text-xs text-destructive">
                               PagePilot is disconnected for this workspace — connect it first.
+                            </p>
+                          ) : !connected ? (
+                            <p className="text-xs text-destructive">
+                              PagePilot reports the token as {tokenCheck.state}: {tokenCheck.reason}
+                              . Reconnect PagePilot on the Integrations page first.
                             </p>
                           ) : null}
                         </>
